@@ -1,22 +1,56 @@
 id: PYSEC-0000-banks-GHSA-556j-vv39-8rqv
-modified: '2026-10-15T10:22:54.200736Z'
-published: '2026-10-15T10:22:54.200736Z'
+summary: 'Banks: Symlink traversal and arbitrary file disclosure/overwrite in DirectoryPromptRegistry'
+details: |-
+  ### Summary
+  In `banks.registries.DirectoryPromptRegistry`, prompt file paths and the index file (`index.json`) do not refuse symbolic links. When a prompt directory contains or accepts untrusted files (e.g. unpacked archives, shared repositories, or multi-tenant folders), symbolic links pointing outside the registry root can be used to disclose arbitrary files via `_scan()` / `get()` or overwrite arbitrary files via `set()` / `_save()`.
+
+  ### Details
+  Following PR #77, `DirectoryPromptRegistry` validates path resolution for prompt names. However:
+  1. `self._index_path` (`index.json`) is not checked for symbolic links. A symlink pointing to an external target (e.g. a configuration file) will be overwritten by `_save()` upon `reg.set()`, or read via `_load()`.
+  2. In `_scan()`, discovered `.jinja` files are opened and indexed without checking if `path.is_symlink()` or if the resolved path escapes the registry root. A symlink pointing to a sensitive file outside the root is read and indexed.
+  3. In `set()`, `prompt_file.write_text(...)` is called without checking if `prompt_file` is an existing symbolic link pointing outside the root.
+
+  ### Impact
+  Arbitrary file disclosure (CWE-59 / CWE-200) and arbitrary file overwrite (CWE-59) in applications where prompt directories can be influenced by untrusted users or extracted from archives.
+
+  ### Proof of Concept
+  ```python
+  import os
+  from pathlib import Path
+  from banks.registries.directory import DirectoryPromptRegistry, DEFAULT_INDEX_NAME
+  from banks.prompt import Prompt
+
+  # Disclose external file via symlink in prompt directory
+  reg_dir = Path("/tmp/registry")
+  reg_dir.mkdir(exist_ok=True)
+  secret = Path("/tmp/secret.txt")
+  secret.write_text("SECRET_API_TOKEN")
+
+  os.symlink(secret, reg_dir / "leak.0.jinja")
+  reg = DirectoryPromptRegistry(reg_dir, force_reindex=True)
+  print("Disclosed content:", reg.get(name="leak", version="0").raw)
+
+  # Overwrite external file via symlink index
+  target = Path("/tmp/target.conf")
+  target.write_text("ORIGINAL")
+  (reg_dir / DEFAULT_INDEX_NAME).unlink(missing_ok=True)
+  os.symlink(target, reg_dir / DEFAULT_INDEX_NAME)
+  reg.set(prompt=Prompt("pwn", name="test", version="1"))
+  print("Target overwritten:", target.read_text())
+  ```
+
+  ### Remediation
+  1. In `_validate_index_path()`: verify `_index_path` is not a symlink and resolves within `_path`.
+  2. In `_scan()`: reject `path.is_symlink()` and check `path.resolve().is_relative_to(root)`.
+  3. In `set()`: reject existing symbolic links before writing.
+
+  A tested fix and regression tests have been prepared and pushed to:
+  https://github.com/jankesec/banks/tree/fix-directory-registry-symlinks-and-nesting
 aliases:
 - CVE-2026-107716
 - GHSA-556j-vv39-8rqv
-summary: 'Banks: Symlink traversal and arbitrary file disclosure/overwrite in DirectoryPromptRegistry'
-details: "### Summary\nIn `banks.registries.DirectoryPromptRegistry`, prompt file paths and the index file (`index.json`) do not refuse symbolic links. When a prompt directory contains or accepts untrusted files (e.g. unpacked archives, shared repositories, or multi-tenant folders), symbolic links pointing outside the registry root can be used to disclose arbitrary files via `_scan()` / `get()` or overwrite arbitrary files via `set()` / `_save()`.\n\n### Details\nFollowing PR #77, `DirectoryPromptRegistry` validates path resolution for prompt names. However:\n1. `self._index_path` (`index.json`) is not checked for symbolic links. A symlink pointing to an external target (e.g. a configuration file) will be overwritten by `_save()` upon `reg.set()`, or read via `_load()`.\n2. In `_scan()`, discovered `.jinja` files are opened and indexed without checking if `path.is_symlink()` or if the resolved path escapes the registry root. A symlink pointing to a sensitive file outside the root is read and indexed.\n3. In `set()`, `prompt_file.write_text(...)` is called without checking if `prompt_file` is an existing symbolic link pointing outside the root.\n\n### Impact\nArbitrary file disclosure (CWE-59 / CWE-200) and arbitrary file overwrite (CWE-59) in applications where prompt directories can be influenced by untrusted users or extracted from archives.\n\n### Proof of Concept\n```python\nimport os\nfrom pathlib import Path\nfrom banks.registries.directory import DirectoryPromptRegistry, DEFAULT_INDEX_NAME\nfrom banks.prompt import Prompt\n\n# Disclose external file via symlink in prompt directory\nreg_dir = Path(\"/tmp/registry\")\nreg_dir.mkdir(exist_ok=True)\nsecret = Path(\"/tmp/secret.txt\")\nsecret.write_text(\"SECRET_API_TOKEN\")\n\nos.symlink(secret, reg_dir / \"leak.0.jinja\")\nreg = DirectoryPromptRegistry(reg_dir, force_reindex=True)\nprint(\"Disclosed content:\", reg.get(name=\"leak\", version=\"0\").raw)\n\n# Overwrite external file via symlink index\ntarget = Path(\"/tmp/target.conf\")\ntarget.write_text(\"ORIGINAL\")\n(reg_dir / DEFAULT_INDEX_NAME).unlink(missing_ok=True)\nos.symlink(target, reg_dir / DEFAULT_INDEX_NAME)\nreg.set(prompt=Prompt(\"pwn\", name=\"test\", version=\"1\"))\nprint(\"Target overwritten:\", target.read_text())\n```\n\n### Remediation\n1. In `_validate_index_path()`: verify `_index_path` is not a symlink and resolves within `_path`.\n2. In `_scan()`: reject `path.is_symlink()` and check `path.resolve().is_relative_to(root)`.\n3. In `set()`: reject existing symbolic links before writing.\n\nA tested fix and regression tests have been prepared and pushed to:\nhttps://github.com/jankesec/banks/tree/fix-directory-registry-symlinks-and-nesting"
-severity: []
-affected:
-- package:
-    ecosystem: PyPI
-    name: banks
-    purl: pkg:pypi/banks
-  ranges:
-  - type: ECOSYSTEM
-    events:
-    - introduced: '0'
-    - fixed: 2.5.1
+modified: '2026-10-15T14:37:35.839432Z'
+published: '2026-10-15T10:22:54.200736Z'
 references:
 - type: WEB
   url: https://github.com/masci/banks/security/advisories/GHSA-556j-vv39-8rqv
@@ -34,3 +68,51 @@ references:
   url: https://github.com/advisories/GHSA-556j-vv39-8rqv
 - type: ADVISORY
   url: https://nvd.nist.gov/vuln/detail/CVE-2026-107716
+affected:
+- package:
+    name: banks
+    ecosystem: PyPI
+    purl: pkg:pypi/banks
+  ranges:
+  - type: ECOSYSTEM
+    events:
+    - introduced: '0'
+    - fixed: 2.5.1
+  versions:
+  - 0.0.1
+  - 0.0.2
+  - 0.0.3
+  - 0.1.0
+  - 0.1.1
+  - 0.2.0
+  - 0.3.0
+  - 0.3.1
+  - 0.4.1
+  - 0.5.0
+  - 0.6.0
+  - 1.0.0
+  - 1.1.0
+  - 1.2.0
+  - 1.2.1
+  - 1.3.0
+  - 1.4.0
+  - 1.5.0
+  - 1.6.0
+  - 1.6.1
+  - 1.7.0
+  - 1.7.1
+  - 1.8.0
+  - 2.0.0
+  - 2.1.0
+  - 2.1.1
+  - 2.1.2
+  - 2.1.3
+  - 2.2.0
+  - 2.3.0
+  - 2.4.0
+  - 2.4.1
+  - 2.4.2
+  - 2.4.3
+  - 2.4.4
+  - 2.4.5
+  - 2.5.0

@@ -1,24 +1,18 @@
 id: PYSEC-0000-uv-GHSA-2cv4-cqwr-gwf7
-modified: '2026-10-15T10:22:45.276429Z'
-published: '2026-10-15T10:22:45.276429Z'
+summary: 'uv: Path traversal on Windows through wheel extraction'
+details: "### Impact\n\nIn versions of uv from 0.12.7 to 0.12.18 on Windows, uv could\
+  \ be induced into writing a file outside of the installation prefix during wheel\
+  \ installation.\n\nA malicious wheel could use this to place an executable outside\
+  \ of the intended environment, including in a directory already present on the user's\
+  \ PATH. \n\nThis vulnerability only affects Windows hosts; no other platforms are\
+  \ affected.\n\n### Patches\n\nuv 0.12.18 and newer address this vulnerability. Users\
+  \ are encouraged to upgrade to 0.12.18.\n\n### Workarounds\n\nThere is no workaround\
+  \ other than upgrading to uv 0.12.18."
 aliases:
 - CVE-2026-104843
 - GHSA-2cv4-cqwr-gwf7
-summary: 'uv: Path traversal on Windows through wheel extraction'
-details: "### Impact\n\nIn versions of uv from 0.12.7 to 0.12.18 on Windows, uv could be induced into writing a file outside of the installation prefix during wheel installation.\n\nA malicious wheel could use this to place an executable outside of the intended environment, including in a directory already present on the user's PATH. \n\nThis vulnerability only affects Windows hosts; no other platforms are affected.\n\n### Patches\n\nuv 0.12.18 and newer address this vulnerability. Users are encouraged to upgrade to 0.12.18.\n\n### Workarounds\n\nThere is no workaround other than upgrading to uv 0.12.18."
-severity:
-- type: CVSS_V4
-  score: CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:A/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N
-affected:
-- package:
-    ecosystem: PyPI
-    name: uv
-    purl: pkg:pypi/uv
-  ranges:
-  - type: ECOSYSTEM
-    events:
-    - introduced: 0.12.7
-    - fixed: 0.12.18
+modified: '2026-10-15T14:38:12.433345Z'
+published: '2026-10-15T10:22:45.276429Z'
 references:
 - type: WEB
   url: https://github.com/astral-sh/uv/security/advisories/GHSA-2cv4-cqwr-gwf7
@@ -36,3 +30,28 @@ references:
   url: https://pypi.org/project/uv
 - type: ADVISORY
   url: https://github.com/advisories/GHSA-2cv4-cqwr-gwf7
+affected:
+- package:
+    name: uv
+    ecosystem: PyPI
+    purl: pkg:pypi/uv
+  ranges:
+  - type: ECOSYSTEM
+    events:
+    - introduced: 0.12.7
+    - fixed: 0.12.18
+  versions:
+  - 0.12.10
+  - 0.12.11
+  - 0.12.12
+  - 0.12.13
+  - 0.12.14
+  - 0.12.15
+  - 0.12.16
+  - 0.12.17
+  - 0.12.7
+  - 0.12.8
+  - 0.12.9
+severity:
+- type: CVSS_V4
+  score: CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:A/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N

