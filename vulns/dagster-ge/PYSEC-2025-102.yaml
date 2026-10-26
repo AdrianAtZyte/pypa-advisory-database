@@ -5,7 +5,7 @@ details: Local File Inclusion in dagster._grpc.impl.get_notebook_data in Dagster
   bypassing the intended extension-based check.
 aliases:
 - CVE-2025-51481
-modified: '2026-10-09T22:09:00.512099Z'
+modified: '2026-10-26T15:30:56.143995Z'
 published: '2025-07-22T17:15:33.543Z'
 references:
 - type: REPORT
@@ -677,6 +677,7 @@ affected:
   - 0.29.24
   - 0.29.25
   - 0.29.26
+  - 0.29.27
   ecosystem_specific: {}
 severity:
 - type: CVSS_V3
